@@ -1,0 +1,26 @@
+# Mini-swe-agent config for an OpenAI-compatible local server (vLLM, SGLang,
+# Ollama, etc.). Merge on top of swebench.yaml.
+#
+# Set these env vars before running:
+#   OPENAI_BASE_URL  (default http://localhost:8000/v1)
+#   OPENAI_API_KEY   (default "EMPTY"; vLLM ignores it)
+#   MODEL_NAME       (the served model id, e.g. Qwen/Qwen3.6-35B-A3B)
+#
+# This file is model-agnostic. Switch between Qwen3.6-35B-A3B and
+# Qwen3-Coder-Next purely by changing MODEL_NAME and the vLLM launch command.
+# orchestra/llm.py:proposer_model_config() injects api_base/api_key from env.
+
+agent:
+  step_limit: 500
+  cost_limit: 1000000.0
+
+model:
+  model_class: litellm
+  model_kwargs:
+    # api_base, api_key, custom_llm_provider are injected from env by proposer_model_config().
+    drop_params: false
+    temperature: 1.0
+    top_p: 0.95
+    timeout: 600
+    max_tokens: 65536
+    parallel_tool_calls: false

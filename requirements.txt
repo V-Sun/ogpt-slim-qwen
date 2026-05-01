@@ -1,0 +1,28 @@
+# Orchestra-GPT slim runtime deps.
+#
+# The model client (orchestra/llm.py) talks to either Azure OpenAI or any
+# OpenAI-compatible endpoint via the official `openai` SDK. Mini-swe-agent
+# (vendored at ./mini-swe-agent) handles its own model calls through LiteLLM,
+# which is pulled in as a transitive dep of mini-swe-agent.
+
+# OpenAI SDK for orchestra/llm.py (Chat Completions and Responses APIs).
+openai >= 1.50, != 1.100.0, != 1.100.1
+
+# SWE-bench dataset loading (used in orchestra/run.py).
+datasets
+
+# Mini-swe-agent runtime deps. Mirrors mini-swe-agent/pyproject.toml's
+# `dependencies` list so `pip install -r requirements.txt` works without
+# `pip install -e ./mini-swe-agent`.
+pyyaml
+requests
+jinja2
+pydantic >= 2.0
+litellm >= 1.75.5, != 1.82.7, != 1.82.8
+tenacity
+rich
+python-dotenv
+typer
+platformdirs
+textual
+prompt_toolkit

@@ -1,0 +1,244 @@
+"""Pairwise comparisons and Copeland winner selection.
+
+From paper: comparator edge σ ≥ α0/2 under D1 condition.
+Position-swap debiasing: run A vs B AND B vs A to cancel lead bias.
+"""
+
+import json
+import re
+import os
+import random
+import litellm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Setup paths
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from orchestra.llm import call_text_model
+from orchestra.rate_limiter import get_api_semaphore
+
+# Environment variables are set in config.py
+
+COMPARATOR_PROMPT_TEMPLATE = """You are a senior software engineer choosing between two patches for a GitHub issue.
+
+ISSUE:
+{problem_statement}
+
+PATCH A:
+{patch_a}
+
+PATCH B:
+{patch_b}
+
+Before deciding, identify specific technical differences: function signatures changed, imports added or removed, files touched, and any test file modifications.
+
+Which patch better fixes the issue? Consider:
+- Correctness: which actually addresses the root cause?
+- Minimality: which makes a more targeted, focused change?
+- Safety: which is less likely to introduce signature mismatches, missing imports, or break other things?
+
+If both patches are equally correct or equally flawed, output "TIE".
+
+Respond in this EXACT JSON format — JSON only, no markdown fences, no extra text:
+{{"winner": "A", "B", or "TIE", "confidence": 1-5, "reasoning": "<one sentence>", "analysis": "<2-3 sentence technical comparison of the differences>"}}
+
+Example where A wins:
+{{"winner": "A", "confidence": 4, "reasoning": "Patch A fixes the root cause by correcting the argument order; Patch B only adds a workaround.", "analysis": "Patch A modifies foo() in utils.py to swap args x and y. Patch B wraps the call site instead. Patch B also introduces an import that is already present in the file."}}
+
+Example of a tie:
+{{"winner": "TIE", "confidence": 2, "reasoning": "Both patches address the issue but both leave the same edge case unhandled.", "analysis": "Patch A changes the condition in handle_request(); Patch B changes it in dispatch(). Both files call the same logic, so either fix is equivalent. Neither patch modifies any test files."}}"""
+
+
+def compare_two_once(patch_a: str, patch_b: str, problem_statement: str,
+                      model_name: str, label_a: str, label_b: str) -> str:
+    """Single comparison between two patches.
+
+    Args:
+        patch_a: First patch
+        patch_b: Second patch
+        problem_statement: GitHub issue
+        model_name: Model string
+        label_a: Label for first patch ("A" or "B")
+        label_b: Label for second patch ("A" or "B")
+
+    Returns:
+        Winner label (label_a, label_b, or "TIE")
+    """
+    prompt = COMPARATOR_PROMPT_TEMPLATE.format(
+        problem_statement=problem_statement[:2000],
+        patch_a=patch_a[:8000],
+        patch_b=patch_b[:8000],
+    )
+    # Same starvation bug as critics, but worse: the comparator prompt holds
+    # two patches (not one) plus a longer "reasoning + analysis" template,
+    # so xhigh reasoning + visible JSON can exceed 6k tokens. 1400 → 6/6
+    # empties in validation; 6144 → still 3/6 failures; 8192 holds steady.
+    max_out = int(os.getenv("ORCHESTRA_COMPARATOR_MAX_OUTPUT_TOKENS", "8192"))
+
+    text = ""
+    try:
+        semaphore = get_api_semaphore()
+        with semaphore:
+            text = call_text_model(model_name, prompt, max_output_tokens=max_out)
+        text = (text or "").strip()
+
+        # Empty / refusal: neither outcome can be trusted — fall back to
+        # unbiased random tiebreak (which is what the bare-except branch
+        # below also does, but we log the specific signal so we can track it).
+        if not text:
+            print(f"        Comparator empty response")
+            return random.choice([label_a, label_b])
+        lowered = text.lower()
+        if ("i'm sorry" in lowered or "i am sorry" in lowered) and "cannot" in lowered:
+            print(f"        Comparator refusal")
+            return random.choice([label_a, label_b])
+
+        text = re.sub(r"```json\s*|\s*```", "", text).strip()
+        if not text.startswith("{"):
+            m = re.search(r"\{.*\}", text, re.DOTALL)
+            if m:
+                text = m.group(0)
+
+        result = json.loads(text)
+        raw_winner = result.get("winner", "A")
+
+        if raw_winner == "TIE":
+            return "TIE"
+        return label_a if raw_winner == "A" else label_b
+
+    except Exception as e:
+        print(f"        Comparator error: {e} | head={text[:120]!r}" if text else f"        Comparator error: {e}")
+        return random.choice([label_a, label_b])
+
+
+def compare_two(patch_a: str, patch_b: str, problem_statement: str,
+                 model_name: str) -> str:
+    """Compare two patches with position-swap debiasing.
+
+    Runs twice: A vs B, then B vs A (positions swapped).
+    This cancels lead bias (LLMs favor whichever option comes first).
+
+    Args:
+        patch_a: First patch
+        patch_b: Second patch
+        problem_statement: GitHub issue
+        model_name: Model string
+
+    Returns:
+        "A" if patch_a wins, "B" if patch_b wins
+    """
+    # Round 1: A vs B (A is first)
+    winner_1 = compare_two_once(
+        patch_a, patch_b, problem_statement, model_name, "A", "B"
+    )
+
+    # Round 2: B vs A (positions swapped — debiases lead preference)
+    winner_2 = compare_two_once(
+        patch_b, patch_a, problem_statement, model_name, "B", "A"
+    )
+    # compare_two_once already returns the correct label, no need to remap
+
+    # Both rounds agree (including both TIE) → take that result
+    if winner_1 == winner_2:
+        return winner_1
+    # One round is TIE, the other picked a winner → go with the non-tie pick
+    if winner_1 == "TIE":
+        return winner_2
+    if winner_2 == "TIE":
+        return winner_1
+    # Both rounds disagree and neither is TIE → random tie-break (unbiased)
+    return random.choice(["A", "B"])
+
+
+def copeland_winner(survivors: list[dict], problem_statement: str,
+                     r: int, model_name: str) -> dict:
+    """Run round-robin tournament with r comparisons per pair.
+
+    Copeland winner = candidate with most pairwise wins.
+
+    From paper: Copeland winner is sound if no B2 event occurs
+    (no unsound proposal beats sound one in pairwise comparison).
+
+    Args:
+        survivors: List of surviving proposals (post-critic filtering)
+        problem_statement: GitHub issue
+        r: Number of comparisons per pair (use odd number for majority)
+        model_name: Model string
+
+    Returns:
+        Winning proposal dict
+    """
+    if len(survivors) == 1:
+        print(f"  [Tournament] Only 1 survivor — automatic winner")
+        return survivors[0]
+
+    n = len(survivors)
+    wins = [0.0] * n
+
+    print(f"  [Tournament] Running round-robin on {n} survivors, r={r}...")
+
+    # Parallelize all comparisons
+    comparison_tasks = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            for round_idx in range(r):
+                comparison_tasks.append((i, j, round_idx))
+
+    # Run all comparisons in parallel (rate-limited by semaphore)
+    comparison_results = {}
+    with ThreadPoolExecutor(max_workers=min(len(comparison_tasks), 100)) as executor:
+        future_to_task = {
+            executor.submit(
+                compare_two,
+                survivors[i]["model_patch"],
+                survivors[j]["model_patch"],
+                problem_statement,
+                model_name,
+            ): (i, j, round_idx)
+            for i, j, round_idx in comparison_tasks
+        }
+
+        for future in as_completed(future_to_task):
+            i, j, round_idx = future_to_task[future]
+            try:
+                winner_label = future.result()
+                key = (i, j)
+                if key not in comparison_results:
+                    comparison_results[key] = 0
+                if winner_label == "TIE":
+                    tie_key = (i, j, "ties")
+                    comparison_results[tie_key] = comparison_results.get(tie_key, 0) + 1
+                elif winner_label == "A":
+                    comparison_results[key] += 1
+                # "B" wins are implicit: decisive rounds where A didn't win
+            except Exception as e:
+                print(f"      Comparison error ({i} vs {j}): {e}")
+
+    # Tally wins based on majority votes; TIE gives 0.5 to each side
+    for i in range(n):
+        for j in range(i + 1, n):
+            key = (i, j)
+            i_wins = comparison_results.get(key, 0)
+            ties = comparison_results.get((i, j, "ties"), 0)
+            decisive = r - ties
+
+            if ties == r:
+                # All rounds tied
+                wins[i] += 0.5
+                wins[j] += 0.5
+            elif i_wins > decisive // 2:
+                wins[i] += 1
+            else:
+                wins[j] += 1
+
+    # Copeland winner: most pairwise wins (random tie-break if multiple max)
+    max_wins = max(wins)
+    best_indices = [i for i, w in enumerate(wins) if w == max_wins]
+    best_idx = random.choice(best_indices)  # Random selection among tied winners
+    winner = survivors[best_idx]
+
+    print(f"  [Tournament] Winner is proposer {winner['k_index']} "
+          f"with {wins[best_idx]}/{n-1} pairwise wins")
+
+    return winner

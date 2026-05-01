@@ -1,0 +1,26 @@
+# Example mini-swe-agent config for Azure OpenAI with the Responses API and
+# reasoning effort. Merge on top of swebench_backticks.yaml.
+#
+# Set these env vars before running:
+#   AZURE_API_KEY, AZURE_API_BASE, AZURE_DEPLOYMENT,
+#   AZURE_API_VERSION (optional, default "2025-03-01-preview"),
+#   AZURE_REASONING_EFFORT (optional, e.g. "high" / "xhigh").
+#
+# orchestra/llm.py:proposer_model_config() reads these from os.environ at
+# runtime and injects them into model_kwargs, so the placeholders below are
+# documentation rather than active env-var interpolation.
+
+agent:
+  step_limit: 500
+  cost_limit: 1000000.0
+
+model:
+  model_class: litellm_response
+  model_kwargs:
+    # api_key, api_base, api_version are injected from env by proposer_model_config().
+    drop_params: false
+    timeout: 1200
+    max_output_tokens: 8192
+    parallel_tool_calls: false
+    reasoning:
+      effort: ${AZURE_REASONING_EFFORT}
