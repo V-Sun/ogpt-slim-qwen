@@ -19,7 +19,24 @@ from orchestra.rate_limiter import get_api_semaphore
 
 # Environment variables are set in config.py
 
-CRITIC_PROMPT_TEMPLATE = """You are a code review expert evaluating a patch for a GitHub issue.
+FLAG_NAMES = (
+    "addresses_root_cause",
+    "preserves_existing_behavior",
+    "tests_actually_test_the_issue",
+    "no_unrelated_changes",
+)
+FLAG_PASS_THRESHOLD = 0.8  # per-flag agreement gate across the M critics
+
+
+CRITIC_PROMPT_TEMPLATE = """You are evaluating whether a patch resolves a GitHub issue. Apply ONE test:
+
+  A correct patch is the smallest change that makes the failing tests pass
+  without breaking the passing tests. Verbosity is not virtue. A 3-line fix
+  is correct if it resolves the issue; a 50-line fix is incorrect if it
+  doesn't.
+
+Do not penalize a patch for being short. Do not reward a patch for being
+long. Length correlates with neither correctness nor robustness.
 
 ISSUE:
 {problem_statement}
@@ -27,25 +44,47 @@ ISSUE:
 PROPOSED PATCH:
 {patch}
 
-Evaluate this patch on these criteria:
-1. Does it address the specific issue described?
-2. Is the diff syntactically valid (proper +/- lines, correct file paths)?
-3. Does it make a targeted fix or does it make unrelated changes?
-4. Does this patch introduce signature mismatches, missing imports, or type inconsistencies that would prevent compilation or cause runtime errors?
+ADVERSARIAL PROBE (required, exactly one):
+Identify the specific failure mode the issue describes. State the smallest
+input or call sequence that, under the original code, would exhibit that
+failure. Then state what the patched code would do on that same input.
+The probe must target the failure described in the ISSUE — do not invent
+edge cases the issue does not mention.
+
+STRUCTURAL FLAGS:
+Set each of these to true or false. A patch is sound iff all flags are true.
+
+  - addresses_root_cause: the patch modifies the code path that produces
+    the failure described in the issue, not a downstream symptom.
+  - preserves_existing_behavior: nothing in the patch changes behavior on
+    inputs unrelated to the failure mode (no signature changes that break
+    other callers, no import removals, no broad refactors).
+  - tests_actually_test_the_issue: under the patched code, the adversarial
+    probe above produces the issue's described correct behavior.
+  - no_unrelated_changes: every hunk in the diff is justified by the issue.
+    Cosmetic edits, unrelated bug "fixes," and out-of-scope refactors fail
+    this flag.
 
 Respond in this EXACT JSON format — JSON only, no markdown fences, no extra text:
 {{
-  "score": <integer 0-10>,
-  "sound": <true if score >= 6, false otherwise>,
-  "reasoning": "<one sentence explaining your score>",
-  "red_flags": ["<specific problem if any, or empty list>"]
+  "flags": {{
+    "addresses_root_cause": <true|false>,
+    "preserves_existing_behavior": <true|false>,
+    "tests_actually_test_the_issue": <true|false>,
+    "no_unrelated_changes": <true|false>
+  }},
+  "probe": "<one sentence: input X under original code produces Y; under patch produces Z>",
+  "sound": <true iff all four flags are true>,
+  "reasoning": "<one sentence justifying the lowest-set flag, or 'all flags pass' if sound>",
+  "red_flags": ["<flag_name>", ...],
+  "score": <10 if sound else 0-5 reflecting how many flags failed>
 }}
 
-Example of a well-formed response:
-{{"score": 7, "sound": true, "reasoning": "Patch correctly fixes the off-by-one in the loop bounds and imports are consistent.", "red_flags": []}}
+Example of a sound patch:
+{{"flags": {{"addresses_root_cause": true, "preserves_existing_behavior": true, "tests_actually_test_the_issue": true, "no_unrelated_changes": true}}, "probe": "calling foo([]) raised IndexError under original code; patch returns [] cleanly.", "sound": true, "reasoning": "all flags pass", "red_flags": [], "score": 10}}
 
-Example of a response flagging a compilation issue:
-{{"score": 2, "sound": false, "reasoning": "Patch calls foo(x, y) but the updated signature is foo(x), causing a TypeError at runtime.", "red_flags": ["signature_mismatch"]}}"""
+Example of an unsound patch (over-broad refactor):
+{{"flags": {{"addresses_root_cause": true, "preserves_existing_behavior": false, "tests_actually_test_the_issue": true, "no_unrelated_changes": false}}, "probe": "calling parse('') returned None under original code; patch returns empty dict.", "sound": false, "reasoning": "patch also rewrites unrelated serialize() function, breaking its callers.", "red_flags": ["preserves_existing_behavior", "no_unrelated_changes"], "score": 4}}"""
 
 
 def critic_evaluate(problem_statement: str, patch: str, model_name: str) -> dict:
@@ -118,7 +157,36 @@ def critic_evaluate(problem_statement: str, patch: str, model_name: str) -> dict
                 text = m.group(0)
 
         result = json.loads(text)
-        result["sound"] = result.get("score", 0) >= 6
+
+        # New per-flag schema: derive sound from AND of all required flags.
+        # Reject as parse-error if the flags dict is missing any required name
+        # — this protects against the old 0-10-only schema slipping through
+        # and being silently treated as "sound" with no flag voting data.
+        flags = result.get("flags") if isinstance(result, dict) else None
+        if not isinstance(flags, dict) or not all(name in flags for name in FLAG_NAMES):
+            return {
+                "score": 0,
+                "sound": False,
+                "reasoning": "critic response missing required flags dict",
+                "red_flags": ["parse_error"],
+                "flags": {},
+            }
+        # Coerce to bools (some models emit "true"/"false" strings).
+        coerced = {n: bool(flags[n]) if not isinstance(flags[n], str)
+                   else flags[n].strip().lower() == "true"
+                   for n in FLAG_NAMES}
+        result["flags"] = coerced
+        result["sound"] = all(coerced.values())
+        # red_flags becomes the list of failed flag names; preserves any
+        # non-flag entries the model added (e.g. "signature_mismatch").
+        failed = [n for n, v in coerced.items() if not v]
+        existing_extras = [
+            r for r in (result.get("red_flags") or [])
+            if isinstance(r, str) and r not in FLAG_NAMES
+        ]
+        result["red_flags"] = failed + existing_extras
+        # Normalize score: if sound, 10; else proportional to flag failures.
+        result["score"] = 10 if result["sound"] else max(0, 5 - len(failed))
         return result
 
     except json.JSONDecodeError as e:
@@ -192,25 +260,56 @@ def run_m_critics(proposal: dict, problem_statement: str,
                     "red_flags": [],
                 })
 
-    # Red-flag filter (Option C): a proposal is filtered only when EVERY
-    # critic returned a structural failure (empty/refusal/parse_error/
-    # critic_error) — i.e. the patch was unevaluable, not low-scoring.
-    # Score-based rejection is delegated to the tournament's pairwise
-    # comparator. This preserves the filter → tournament pipeline while
-    # avoiding poorly-calibrated thresholds on score.
+    # Per-flag 80% aggregation: for each named structural flag, count how many
+    # critics voted true and require >= FLAG_PASS_THRESHOLD * M agreement.
+    # Proposal survives iff EVERY flag clears its threshold. Critics that hit
+    # a structural failure (empty/refusal/parse_error/critic_error) implicitly
+    # vote false on every flag, since they produced no usable signal — this
+    # is the conservative interpretation and biases toward filtering when
+    # critic responses degrade.
+    #
+    # Safety net: if every critic returned a structural failure (the proposal
+    # is unevaluable rather than low-quality), defer the decision to the
+    # tournament — see filter_proposals fall-through.
     STRUCTURAL_FLAGS = {"empty_response", "refusal", "parse_error", "critic_error"}
     unevaluable = [
         s for s in scores if set(s.get("red_flags") or []) & STRUCTURAL_FLAGS
     ]
-    all_unevaluable = scores and len(unevaluable) == len(scores)
+    all_unevaluable = bool(scores) and len(unevaluable) == len(scores)
+
+    flag_votes = {name: 0 for name in FLAG_NAMES}
+    for s in scores:
+        flags = s.get("flags") or {}
+        for name in FLAG_NAMES:
+            if bool(flags.get(name, False)):
+                flag_votes[name] += 1
+
+    denom = max(len(scores), 1)
+    flag_pass = {
+        name: (flag_votes[name] / denom) >= FLAG_PASS_THRESHOLD
+        for name in FLAG_NAMES
+    }
     avg_score = sum(s["score"] for s in scores) / len(scores) if scores else 0
 
     proposal["critic_scores"] = scores
     proposal["critic_avg"] = avg_score
-    # critic_sound is retained for downstream logging but no longer gates
-    # selection. True iff at least one critic produced a usable score.
-    proposal["critic_sound"] = not all_unevaluable
-    proposal["filtered"] = bool(all_unevaluable)
+    proposal["critic_flag_votes"] = flag_votes      # raw vote count per flag
+    proposal["critic_flag_pass"] = flag_pass        # which flags cleared 80%
+    proposal["critic_sound"] = all(flag_pass.values()) and not all_unevaluable
+
+    # Filter unless either (a) all flags pass per-critic 80% gate, or
+    # (b) every critic was structurally unevaluable (let tournament decide
+    # via filter_proposals' fallthrough).
+    if all_unevaluable:
+        proposal["filtered"] = False
+        proposal["filter_reason"] = "all_unevaluable_pass_through"
+    elif all(flag_pass.values()):
+        proposal["filtered"] = False
+        proposal["filter_reason"] = "all_flags_pass_threshold"
+    else:
+        failed_flags = [n for n, ok in flag_pass.items() if not ok]
+        proposal["filtered"] = True
+        proposal["filter_reason"] = f"flags_below_threshold:{','.join(failed_flags)}"
 
     return proposal
 
@@ -267,14 +366,16 @@ def filter_proposals(proposals: list[dict], problem_statement: str,
     survivors = [p for p in evaluated if not p["filtered"]]
     filtered = [p for p in evaluated if p["filtered"]]
 
-    # Safety: if every proposal was unevaluable (all M critics errored for
-    # every candidate), pass them through anyway — tournament is the decider.
-    # Under Option C we don't fall back to a score-based "best" since critic
-    # scores aren't trusted for ranking.
+    # Safety: if EVERY proposal failed the critic gate (whether due to
+    # structural critic failures or per-flag agreement falling below the
+    # 80% threshold for at least one flag on every proposal), pass them
+    # all through to the tournament. We need a candidate for the comparator
+    # stage; the tournament's pairwise comparison is the residual signal.
     if not survivors and evaluated:
-        print(f"  [Critics] All proposals unevaluable — passing through; tournament decides")
+        print(f"  [Critics] No proposal cleared the per-flag gate — passing all through; tournament decides")
         for p in evaluated:
             p["filtered"] = False
+            p["filter_reason"] = "all_filtered_pass_through"
         survivors = evaluated
         filtered = []
 

@@ -20,7 +20,14 @@ from orchestra.rate_limiter import get_api_semaphore
 
 # Environment variables are set in config.py
 
-COMPARATOR_PROMPT_TEMPLATE = """You are a senior software engineer choosing between two patches for a GitHub issue.
+COMPARATOR_PROMPT_TEMPLATE = """You are deciding which of two patches is more likely to make the failing
+tests pass without breaking the passing tests. That is the only question
+you are answering. Aesthetics, ambition, and visible effort are not relevant.
+
+Do NOT select a patch because it makes more changes, addresses more cases,
+or appears more thorough. The patch that minimally resolves the stated
+issue is preferred. A 4kb patch that fixes the bug beats an 11kb patch
+that doesn't.
 
 ISSUE:
 {problem_statement}
@@ -31,23 +38,50 @@ PATCH A:
 PATCH B:
 {patch_b}
 
-Before deciding, identify specific technical differences: function signatures changed, imports added or removed, files touched, and any test file modifications.
+REQUIRED STRUCTURAL COMPARISON (fill these in BEFORE deciding):
 
-Which patch better fixes the issue? Consider:
-- Correctness: which actually addresses the root cause?
-- Minimality: which makes a more targeted, focused change?
-- Safety: which is less likely to introduce signature mismatches, missing imports, or break other things?
+  1. Failing test hypothesis: state the smallest hypothesis about what is
+     wrong, derived from the issue text alone. One sentence. This is the
+     ground truth you compare both patches against.
 
-If both patches are equally correct or equally flawed, output "TIE".
+  2. A_changes: list the specific lines/functions Patch A modifies.
+  3. B_changes: list the specific lines/functions Patch B modifies.
+
+  4. A_consistent_with_hypothesis: do A's changes plausibly cause the
+     failing test in the issue to start passing? (true/false + one-line
+     justification)
+  5. B_consistent_with_hypothesis: same question for B.
+
+  6. A_collateral: does A change behavior on inputs unrelated to the
+     failure mode? (true/false + one-line justification)
+  7. B_collateral: same question for B.
+
+The decision falls out of this comparison; do not pull a winner from prior.
+If exactly one patch is consistent with the hypothesis and the other is
+not, that one wins. If both are consistent, prefer the one with less
+collateral. If both fail the hypothesis, output TIE. If they are
+functionally equivalent (same lines changed differently, or different
+lines that produce the same behavior), output TIE.
 
 Respond in this EXACT JSON format — JSON only, no markdown fences, no extra text:
-{{"winner": "A", "B", or "TIE", "confidence": 1-5, "reasoning": "<one sentence>", "analysis": "<2-3 sentence technical comparison of the differences>"}}
+{{
+  "hypothesis": "<one sentence>",
+  "a_changes": "<files/functions modified by A>",
+  "b_changes": "<files/functions modified by B>",
+  "a_consistent": <true|false>,
+  "b_consistent": <true|false>,
+  "a_collateral": <true|false>,
+  "b_collateral": <true|false>,
+  "winner": "A" | "B" | "TIE",
+  "confidence": <integer 1-5>,
+  "reasoning": "<one sentence: why the winner falls out of the structural comparison>"
+}}
 
-Example where A wins:
-{{"winner": "A", "confidence": 4, "reasoning": "Patch A fixes the root cause by correcting the argument order; Patch B only adds a workaround.", "analysis": "Patch A modifies foo() in utils.py to swap args x and y. Patch B wraps the call site instead. Patch B also introduces an import that is already present in the file."}}
+Example where minimal correct beats ambitious broken:
+{{"hypothesis": "splitter.split() returns wrong order when n=0.", "a_changes": "fixes the boundary check in splitter.py:42 (3 lines).", "b_changes": "rewrites split() in splitter.py and adds a new helper class SplitContext with retry logic (87 lines).", "a_consistent": true, "b_consistent": false, "a_collateral": false, "b_collateral": true, "winner": "A", "confidence": 5, "reasoning": "A directly fixes the n=0 boundary; B's rewrite changes signatures other callers depend on and does not address the n=0 case."}}
 
 Example of a tie:
-{{"winner": "TIE", "confidence": 2, "reasoning": "Both patches address the issue but both leave the same edge case unhandled.", "analysis": "Patch A changes the condition in handle_request(); Patch B changes it in dispatch(). Both files call the same logic, so either fix is equivalent. Neither patch modifies any test files."}}"""
+{{"hypothesis": "format_date crashes on tz-naive datetimes.", "a_changes": "guards format_date() with isinstance check (4 lines).", "b_changes": "guards the same call site in render_template() instead (5 lines).", "a_consistent": true, "b_consistent": true, "a_collateral": false, "b_collateral": false, "winner": "TIE", "confidence": 3, "reasoning": "Both patches resolve the failure mode in different but equivalent locations; no structural reason to prefer one."}}"""
 
 
 def compare_two_once(patch_a: str, patch_b: str, problem_statement: str,

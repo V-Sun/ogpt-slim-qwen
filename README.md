@@ -2,7 +2,7 @@
 
 ## What this is
 
-Orchestra-GPT runs a three-tier committee protocol on SWE-bench Verified instances. For each task it spawns K independent generator agents (mini-swe-agent), routes each candidate patch through M reviewer LLM calls that filter structurally broken outputs, and resolves the survivors via an R-round Copeland tournament with position-swap debiasing. The committee returns a single winning patch ready for the SWE-bench evaluation harness.
+Orchestra-GPT runs a three-tier committee protocol on SWE-bench Verified instances. For each task it spawns K independent generator agents (mini-swe-agent), routes each candidate patch through M reviewer LLM calls that vote on four named structural flags (with a per-flag 80% agreement gate), and resolves the survivors via an R-round Copeland tournament that performs a structured pairwise comparison with position-swap debiasing. The committee returns a single winning patch ready for the SWE-bench evaluation harness.
 
 The runtime is model-agnostic. The default configuration targets a local vLLM server speaking the OpenAI-compatible API; the same code path also handles Azure OpenAI (including the Responses API with reasoning effort) by flipping a single environment variable.
 
@@ -196,8 +196,17 @@ The committee runs three stages per SWE-bench instance:
 
 The Generator pool spawns K mini-swe-agent instances in parallel, each operating in its own Docker sandbox with the SWE-bench instance's repository. Each generator receives a different system prompt to reduce inter-proposer correlation. Generators produce candidate patches by exploring the repository, running tests, and iterating until they submit a diff or hit the step limit.
 
-The Reviewer pool runs M reviewer LLM calls per non-empty patch. Each reviewer scores soundness, surfaces red flags, and returns structured JSON. A patch is filtered only if all M reviewers structurally fail (parse error, refusal, empty response). This is conservative on purpose: score-based rejection is deferred to the tournament rather than gating it.
+The Reviewer pool runs M reviewer LLM calls per non-empty patch. Each reviewer returns a structured JSON containing four named structural flags plus an adversarial probe. The flags are:
 
-The Comparator pool runs an R-round Copeland tournament across the survivors. Each unordered pair of patches is judged R times with position swap (A vs B, then B vs A) to cancel position bias. The winner of each pair is the patch with more wins across the R rounds; the overall winner is the patch with the highest Copeland score across all pairings. Ties are broken by majority within rounds, then by random selection.
+- `addresses_root_cause` — the patch modifies the code path producing the issue, not a downstream symptom.
+- `preserves_existing_behavior` — nothing in the patch changes behavior on inputs unrelated to the failure mode.
+- `tests_actually_test_the_issue` — under the patched code, the reviewer's adversarial probe produces the issue's correct behavior.
+- `no_unrelated_changes` — every hunk in the diff is justified by the issue.
+
+A reviewer's `sound` verdict is the AND of its four flag votes. The Reviewer pool aggregates **per-flag, not per-reviewer**: for each named flag we count the number of reviewers that voted `true`, divide by M (reviewers that returned a structural failure — parse error, refusal, empty — implicitly vote `false`), and require the ratio to clear the per-flag threshold (`FLAG_PASS_THRESHOLD = 0.8` by default). A patch survives the Reviewer pool iff **every flag clears the 80% threshold across the M reviewers**. Patches where at least one flag falls below threshold are filtered. This makes the structural flags meaningful: a single named failure mode that 21% of reviewers see is enough to block a patch, even if its 0–10 score average would have looked sound under the old logic.
+
+Two safety nets sit on top of the per-flag gate. (1) If every reviewer for a given proposal returned a structural failure, the proposal passes through to the tournament rather than being filtered — we cannot trust a flag aggregation when no reviewer produced usable signal. (2) If every proposal across a task is filtered, all candidates pass through to the tournament so the comparator can still produce a winner.
+
+The Comparator pool runs an R-round Copeland tournament across the survivors. Each pairwise judgment is structured: the comparator must first commit to a single-sentence hypothesis about what the failing test is testing, list the lines or functions each patch modifies, and judge each patch's consistency with the hypothesis and its collateral impact (changes to behavior outside the failure mode) before reporting `winner ∈ {A, B, TIE}`. The structured fields force the verdict to fall out of the comparison rather than be pulled from prior, which addresses the documented effort-bias failure mode: ambitious-but-broken patches no longer beat minimal-correct patches on aesthetics. Each unordered pair is judged R times with position swap (A vs B, then B vs A) to cancel lead bias; ties contribute 0.5 to each side in Copeland aggregation. The overall winner is the patch with the highest Copeland score across all pairings; ties at the top are broken by random selection.
 
 The three pools are decoupled: the generator pool is bounded by Docker concurrency, the reviewer and comparator pools by API throughput. Per-role model overrides (`GENERATOR_MODEL`, `REVIEWER_MODEL`, `COMPARATOR_MODEL`) allow mixing different Qwen variants per role for ablation studies without changing code.
